@@ -17,6 +17,7 @@ from transformers import (
     HfArgumentParser,
     TrainingArguments,
     AutoConfig,
+    set_seed,
 )
 
 from trl import SFTTrainer
@@ -35,6 +36,8 @@ class ScriptArguments:
 parser = HfArgumentParser(ScriptArguments)
 conf = parser.parse_args_into_dataclasses()[0]
 conf = OmegaConf.load(conf.config_path)
+
+set_seed(conf.seed)
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -68,6 +71,7 @@ base_model = AutoModelForCausalLM.from_pretrained(
     quantization_config=bnb_config,
     device_map={"": Accelerator().local_process_index},
     trust_remote_code=True,
+    # use_flash_attention_2=True
 )
 
 peft_config = LoraConfig(
@@ -83,8 +87,21 @@ peft_config = LoraConfig(
 base_model = prepare_model_for_kbit_training(base_model)
 
 tokenizer = AutoTokenizer.from_pretrained(conf.name_or_path, trust_remote_code=True)
-tokenizer.pad_token = tokenizer.eos_token
+# tokenizer.pad_token = tokenizer.eos_token
+# tokenizer.pad_token = '<|pad|>'
+tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
+
+# tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+# base_model.resize_token_embeddings(len(tokenizer))  # todo: I think this is fine if during the training pad is ignored
+# #base_model.transformer.word_embeddings.padding_idx = len(tokenizer) - 1
+# #base_model.config.max_new_tokens = len(tokenizer)
+# print(base_model)
+# # model.config.min_length = 1
+# # print(f'{base_model=}')
+# # print(f'{type(tokenizer)=}')
+print(f"{tokenizer.pad_token}")
+
 
 training_args = TrainingArguments(
     output_dir=conf.output_dir,
@@ -140,9 +157,11 @@ trainer = SFTTrainer(
     max_seq_length=conf.seq_length,
     tokenizer=tokenizer,
     args=training_args,
+    # neftune_noise_alpha=5,
 )
 
 trainer.train()
+
 trainer.save_model(conf.output_dir)
 
 output_dir = os.path.join(conf.output_dir, "final_checkpoint")
@@ -157,17 +176,3 @@ with open(os.path.join(conf.output_dir, "config.yaml"), "w") as file:
 # Free memory for merging weights
 del base_model
 torch.cuda.empty_cache()
-
-model = AutoPeftModelForCausalLM.from_pretrained(
-    output_dir,
-    device_map="auto",
-    torch_dtype=torch.bfloat16,
-    trust_remote_code=True,
-)
-model = model.merge_and_unload()
-
-output_merged_dir = os.path.join(conf.output_dir, "final_merged_checkpoint")
-model.save_pretrained(
-    output_merged_dir,
-    safe_serialization=True,
-)
